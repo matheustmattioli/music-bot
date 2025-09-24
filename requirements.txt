@@ -1,7 +1,6 @@
 discord.py==2.3.2
 yt-dlp
 youtube-search-python
-python-Levenshtein
 python-dotenv
-
-
+ruff
+pre-commit

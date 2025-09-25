@@ -7,7 +7,9 @@ class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="help", help="Displays all available commands")
+    @commands.command(
+        name="help", aliases=["h"], help="Displays all available commands"
+    )
     async def help_command(self, ctx):
         embed = discord.Embed(
             title="🎵 Music Bot Commands",

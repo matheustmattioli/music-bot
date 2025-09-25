@@ -1,13 +1,12 @@
 import os
 import asyncio
-import shlex
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Optional
 import discord
 from discord import VoiceChannel
 from yt_dlp import YoutubeDL
-from discord.errors import DiscordException
 from discord.ext import commands
 from discord.ext.commands import Bot
+from yt_dlp.utils import ExtractorError
 
 
 class Music(commands.Cog):
@@ -18,12 +17,28 @@ class Music(commands.Cog):
         self.is_playing: bool = False
         self.is_paused: bool = False
         self.repeat: bool = False
-
         self.music_queue: list[tuple[dict[str, str], VoiceChannel]] = []
-        self.YDL_OPTIONS: dict[str, str] = {"format": "bestaudio/best"}
 
-        self.FFMPEG_OPTIONS: dict[str, str] = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        self._last_ctx = None
+        self._last_channel: Optional[discord.VoiceChannel] = None
+
+        self.YDL_OPTIONS: dict[str, Any] = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "default_search": "ytsearch",
+            "socket_timeout": 10,
+            "source_address": "0.0.0.0",
+        }
+
+        self.FFMPEG_OPTIONS = {
+            "before_options": (
+                "-nostdin "
+                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                "-rw_timeout 10000000 "  # 15s read/write timeout (µs)
+            ),
             "options": '-vn -filter:a "volume=0.30"',
         }
 
@@ -50,20 +65,6 @@ class Music(commands.Cog):
         self.vc = new_vc
         return new_vc
 
-    def _build_before_with_headers(
-        self, headers: Optional[Mapping[str, str]], referer: str
-    ) -> str:
-        parts = ["-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"]
-        if headers:
-            ua = headers.get("User-Agent") or headers.get("user-agent") or "Mozilla/5.0"
-            parts.append(f"-user_agent {shlex.quote(ua)}")
-        if referer:
-            parts.append(f"-referer {shlex.quote(referer)}")
-        if headers:
-            blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-            parts.append(f"-headers {shlex.quote(blob)}")
-        return " ".join(parts)
-
     def search_yt(self, item: str) -> dict[str, str] | None:
         try:
             if item.startswith(("http://", "https://")):
@@ -86,103 +87,59 @@ class Music(commands.Cog):
             print(f"YT search error: {e!r}")
             return None
 
-    async def play_next(self) -> None:
-        if len(self.music_queue) == 0:
+    async def play_next(self, ctx) -> None:
+        if len(self.music_queue) <= 0:
             self.is_playing = False
             self.is_paused = False
-
-            if self.vc and getattr(self.vc, "is_connected", lambda: False)():
-                try:
-                    await self.vc.disconnect()
-                except Exception:
-                    pass  # TODO: Trigger a less generic exception and log it
+            if self.vc:
+                await self.vc.disconnect()
+            else:
+                print("Not connected")
             return
 
         self.is_playing = True
-
-        song_entry = self.music_queue[0]
-        song_dict: dict[str, Any] = (
-            song_entry[0] if isinstance(song_entry, (list, tuple)) else song_entry
-        )
-        m_url: str = str(song_dict.get("source") or "")
+        m_url = self.music_queue[0][0]["source"]
 
         if not self.repeat:
             self.music_queue.pop(0)
 
-        if not self.vc:
-            self.is_playing = False
-            return
-
-        def _after(_: Optional[Exception]) -> None:
-            asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
+        ffmpeg_bin = "ffmpeg" if os.name != "nt" else "ffmpeg.exe"
 
         if os.path.isfile(m_url):
-            try:
-                ffmpeg_opts = getattr(self, "FFMPEG_OPTIONS", {}) or {}
-                self.vc.play(
-                    discord.FFmpegOpusAudio(
-                        source=m_url,
-                        executable="ffmpeg" if os.name != "nt" else "ffmpeg.exe",
-                        **ffmpeg_opts,
-                    ),
-                    after=_after,
-                )
-            except DiscordException as e:
-                print(f"[music] local play error: {e!r}")
-                _after(None)
-            return
-        try:
-            data_map: Optional[Mapping[str, Any]] = cast(
-                Optional[Mapping[str, Any]],
-                await asyncio.to_thread(self.ytdl.extract_info, m_url, False),
+            stream_url = m_url
+        else:
+            data = await asyncio.to_thread(
+                self.ytdl.extract_info, m_url, download=False
             )
-        except Exception as e:
-            print(f"[music] ytdl extract error: {e!r}")
-            _after(None)
-            return
+            stream_url = data.get("url")
+            if not stream_url:
+                print("could not play next song, failed to extract youtube info")
+                return
 
-        if not data_map:
-            _after(None)
-            return
-
-        entries = cast(
-            Optional[list[Optional[Mapping[str, Any]]]], data_map.get("entries")
-        )
-        if entries and len(entries) > 0:
-            first = entries[0] or {}
-            data_map = cast(Mapping[str, Any], first)
-
-        stream_url: Optional[str] = cast(Optional[str], data_map.get("url"))
-
-        if not stream_url:
-            formats = cast(list[Mapping[str, Any]], data_map.get("formats") or [])
-            for fmt in formats:
-                url = cast(Optional[str], fmt.get("url"))
-                acodec = cast(Optional[str], fmt.get("acodec"))
-                if url and acodec != "none":
-                    stream_url = url
-                    break
-
-        if not isinstance(stream_url, str) or not stream_url:
-            _after(None)
+        if not self.vc:
+            await ctx.send("```Not connected to a voice channel: can't play")
             return
 
         try:
-            ffmpeg_opts = getattr(self, "FFMPEG_OPTIONS", {}) or {}
             self.vc.play(
                 discord.FFmpegOpusAudio(
                     stream_url,
-                    executable="ffmpeg" if os.name != "nt" else "ffmpeg.exe",
-                    **ffmpeg_opts,
+                    executable=ffmpeg_bin,
+                    **getattr(self, "FFMPEG_OPTIONS", {}),
                 ),
-                after=_after,
+                after=lambda error: asyncio.run_coroutine_threadsafe(
+                    self.play_next(ctx), self.bot.loop
+                )
+                if not error
+                else print(f"Playback error: {error}"),
             )
         except Exception as e:
-            print(f"[music] stream play error: {e!r}")
-            _after(None)
+            print(f"[playback] start failed: {e!r}")
+            await ctx.send(f"```FFmpeg failed to start: {e}```")
+            self.is_playing = False
 
     async def play_music(self, ctx) -> None:
-        if not self.music_queue:
+        if len(self.music_queue) <= 0:
             self.is_playing = False
             await ctx.send("```No music to play```")
             return
@@ -191,66 +148,47 @@ class Music(commands.Cog):
         song_dict, voice_channel = self.music_queue[0]
         async with self.vc_lock:
             await self._ensure_vc(ctx, voice_channel)
+            self._last_ctx = ctx
+            self._last_channel = voice_channel
 
         m_url: str = song_dict["source"]
 
         if not self.repeat:
             self.music_queue.pop(0)
 
-        stream_url: str
-        headers: dict[str, str] | None
-        referer: str
-
         if os.path.isfile(m_url):
             stream_url = m_url
-            headers = None
-            referer = ""
         else:
-            info: Optional[dict[str, Any]] = await asyncio.to_thread(
-                self.ytdl.extract_info, m_url, False
-            )
-            if not info:
-                await ctx.send("```Could not extract info for the requested track```")
-                self.is_playing = False
+            try:
+                data = await asyncio.to_thread(
+                    self.ytdl.extract_info, m_url, download=False
+                )
+                stream_url = data.get("url")
+                if not stream_url:
+                    await ctx.send("```Could not extract a playable URL```")
+                    raise ExtractorError("Could not extract a playable URL")
+            except ExtractorError as e:
+                await ctx.send(f"```Error extracting info: {e}```")
                 return
 
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0] or {}
-
-            stream_url = info.get("url") or ""
-            if not stream_url:
-                for fmt in info.get("formats", []) or []:
-                    u = fmt.get("url")
-                    if u and fmt.get("acodec") != "none":
-                        stream_url = u
-                        break
-
-            if not stream_url:
-                await ctx.send("```No playable formats found for this video```")
-                self.is_playing = False
-                return
-
-            headers = info.get("http_headers") or {}
-            referer = info.get("webpage_url") or "https://www.youtube.com"
-
-        before_options = self._build_before_with_headers(headers, referer)
-        options = self.FFMPEG_OPTIONS.get("options", "-vn")
         ffmpeg_bin = "ffmpeg" if os.name != "nt" else "ffmpeg.exe"
 
-        def _after(err: Optional[Exception]) -> None:
-            if err:
-                print(f"[playback] error: {err!r}")
-            asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
+        if not self.vc:
+            ctx.send("```Not connected to a voice channel: can't play")
+            return
 
         try:
             self.vc.play(
                 discord.FFmpegOpusAudio(
                     stream_url,
                     executable=ffmpeg_bin,
-                    before_options=before_options,
-                    options=options,
+                    **getattr(self, "FFMPEG_OPTIONS", {}),
                 ),
-                after=_after,
+                after=lambda error: asyncio.run_coroutine_threadsafe(
+                    self.play_next(ctx), self.bot.loop
+                )
+                if not error
+                else print(f"Playback error: {error}"),
             )
         except Exception as e:
             print(f"[playback] start failed: {e!r}")
@@ -299,6 +237,8 @@ class Music(commands.Cog):
         async with self.vc_lock:
             try:
                 await self._ensure_vc(ctx, voice_channel)
+                self._last_ctx = ctx
+                self._last_channel = voice_channel
                 await ctx.send(
                     f"🔊 Connected to **{self.vc.channel.name}**"
                     if self.vc

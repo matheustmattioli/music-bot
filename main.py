@@ -21,6 +21,7 @@ async def main():
 
         token = os.getenv("TOKEN")
         if token is not None:
+            print("Bot started!!")
             await bot.start(token)
         else:
             print("Discord API Access Token not available")

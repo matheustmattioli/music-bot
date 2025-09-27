@@ -1,5 +1,6 @@
 import os
 import asyncio
+import shlex
 from typing import Any, Optional
 import discord
 from discord import VoiceChannel
@@ -34,11 +35,6 @@ class Music(commands.Cog):
         }
 
         self.FFMPEG_OPTIONS = {
-            "before_options": (
-                "-nostdin "
-                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                "-rw_timeout 10000000 "  # 15s read/write timeout (µs)
-            ),
             "options": '-vn -filter:a "volume=0.30"',
         }
 
@@ -64,6 +60,20 @@ class Music(commands.Cog):
         new_vc = await voice_channel.connect(timeout=10, reconnect=True)
         self.vc = new_vc
         return new_vc
+
+    def _before_with_headers(self, headers: dict[str, str] | None, referer: str) -> str:
+        parts = [
+            "-nostdin "
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            "-rw_timeout 10000000 "  # 15s read/write timeout (µs)
+        ]
+        if headers:
+            ua = headers.get("User-Agent") or headers.get("user-agent") or "Mozilla/5.0"
+            blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            parts += [f"-user_agent {shlex.quote(ua)}", f"-headers {shlex.quote(blob)}"]
+        if referer:
+            parts.append(f"-referer {shlex.quote(referer)}")
+        return " ".join(parts)
 
     def search_yt(self, item: str) -> dict[str, str] | None:
         try:
@@ -107,10 +117,14 @@ class Music(commands.Cog):
 
         if os.path.isfile(m_url):
             stream_url = m_url
+            before = self._before_with_headers(None, "")
         else:
             data = await asyncio.to_thread(
                 self.ytdl.extract_info, m_url, download=False
             )
+            headers = data.get("http_headers") or {}
+            referer = data.get("webpage_url") or "https://www.youtube.com"
+            before = self._before_with_headers(headers, referer)
             stream_url = data.get("url")
             if not stream_url:
                 print("could not play next song, failed to extract youtube info")
@@ -125,6 +139,7 @@ class Music(commands.Cog):
                 discord.FFmpegOpusAudio(
                     stream_url,
                     executable=ffmpeg_bin,
+                    before_options=before,
                     **getattr(self, "FFMPEG_OPTIONS", {}),
                 ),
                 after=lambda error: asyncio.run_coroutine_threadsafe(
@@ -158,12 +173,16 @@ class Music(commands.Cog):
 
         if os.path.isfile(m_url):
             stream_url = m_url
+            before = self._before_with_headers(None, "")
         else:
             try:
                 data = await asyncio.to_thread(
                     self.ytdl.extract_info, m_url, download=False
                 )
                 stream_url = data.get("url")
+                headers = data.get("http_headers") or {}
+                referer = data.get("webpage_url") or "https://www.youtube.com"
+                before = self._before_with_headers(headers, referer)
                 if not stream_url:
                     await ctx.send("```Could not extract a playable URL```")
                     raise ExtractorError("Could not extract a playable URL")
@@ -182,6 +201,7 @@ class Music(commands.Cog):
                 discord.FFmpegOpusAudio(
                     stream_url,
                     executable=ffmpeg_bin,
+                    before_options=before,
                     **getattr(self, "FFMPEG_OPTIONS", {}),
                 ),
                 after=lambda error: asyncio.run_coroutine_threadsafe(
